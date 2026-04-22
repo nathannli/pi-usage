@@ -28,16 +28,21 @@ interface CodexUsage {
 	activeLimit: string;
 	primaryUsedPercent: number;      // 5hr window
 	secondaryUsedPercent: number;    // weekly window
+	codeReviewUsedPercent?: number;
 	primaryWindowMinutes: number;
 	secondaryWindowMinutes: number;
+	codeReviewWindowMinutes?: number;
 	primaryResetAfterSeconds: number;
 	secondaryResetAfterSeconds: number;
+	codeReviewResetAfterSeconds?: number;
 	primaryResetAt: number;          // unix timestamp seconds
 	secondaryResetAt: number;
+	codeReviewResetAt?: number;
 	primaryOverSecondaryLimitPercent: number;
 	creditsHasCredits: boolean;
 	creditsBalance: string;
 	creditsUnlimited: boolean;
+	source?: "usage_api" | "probe";
 	error?: string;
 }
 
@@ -58,6 +63,7 @@ interface CodexOAuthCredential {
 }
 
 type AuthJson = Record<string, AuthApiKeyCredential | CodexOAuthCredential | undefined>;
+type OpenAIOAuthSourceKey = (typeof OPENAI_OAUTH_SOURCE_KEYS)[number];
 
 interface GoCheckModel {
 	id: string;
@@ -112,8 +118,10 @@ const CHECK_TIMEOUT_MS = 15_000;
 const AUTO_REFRESH_MINUTES = parseEnvInt("PI_USAGE_REFRESH_MIN", 30);
 const CODEX_REFRESH_SKEW_MS = 60_000;
 const CODEX_PROBE_MODEL = "gpt-5.4-mini";
+const OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_QUOTA_CONFIG_FILE = path.join("opencode-quota", "opencode-go.json");
 const OPENCODE_GO_DASHBOARD_URL_PREFIX = "https://opencode.ai/workspace";
+const OPENAI_OAUTH_SOURCE_KEYS = ["openai-codex", "openai", "codex", "chatgpt", "opencode"] as const;
 
 // OpenCode Go publishes a fixed dollar limit, but no public usage/balance API.
 // These are used only as the probe fallback when the installed pi model registry
@@ -260,12 +268,22 @@ function resolveConfigValue(config: string): string | undefined {
 	return process.env[config] || config;
 }
 
-async function getCodexToken(): Promise<{ token: string; accountId: string } | undefined> {
+async function getCodexToken(): Promise<{ token: string; accountId: string; sourceKey: OpenAIOAuthSourceKey } | undefined> {
 	try {
 		const auth = readAuthJson();
 		if (!auth) return undefined;
-		const codex = auth["openai-codex"] as CodexOAuthCredential | undefined;
-		if (!codex?.access) return undefined;
+
+		let sourceKey: OpenAIOAuthSourceKey | undefined;
+		let codex: CodexOAuthCredential | undefined;
+		for (const key of OPENAI_OAUTH_SOURCE_KEYS) {
+			const candidate = auth[key] as CodexOAuthCredential | undefined;
+			if (candidate?.type === "oauth" && candidate.access) {
+				sourceKey = key;
+				codex = candidate;
+				break;
+			}
+		}
+		if (!sourceKey || !codex?.access) return undefined;
 
 		if (codex.refresh && (!codex.expires || Date.now() + CODEX_REFRESH_SKEW_MS >= codex.expires)) {
 			const refreshed = await refreshOpenAICodexToken(codex.refresh);
@@ -273,14 +291,14 @@ async function getCodexToken(): Promise<{ token: string; accountId: string } | u
 				? refreshed.accountId
 				: extractAccountId(refreshed.access);
 			if (!accountId) return undefined;
-			auth["openai-codex"] = { type: "oauth", ...refreshed, accountId };
+			auth[sourceKey] = { type: "oauth", ...refreshed, accountId };
 			writeAuthJson(auth);
-			return { token: refreshed.access, accountId };
+			return { token: refreshed.access, accountId, sourceKey };
 		}
 
 		const accountId = codex.accountId ?? extractAccountId(codex.access);
 		if (!accountId) return undefined;
-		return { token: codex.access, accountId };
+		return { token: codex.access, accountId, sourceKey };
 	} catch {
 		return undefined;
 	}
@@ -347,9 +365,124 @@ function statusIcon(status: GoModelStatus): string {
 	}
 }
 
+interface OpenAIUsageWindow {
+	used_percent?: number;
+	limit_window_seconds?: number;
+	reset_after_seconds?: number;
+	reset_at?: number;
+}
+
+interface OpenAIUsageResponse {
+	plan_type?: string;
+	rate_limit?: {
+		limit_reached?: boolean;
+		primary_window?: OpenAIUsageWindow | null;
+		secondary_window?: OpenAIUsageWindow | null;
+	} | null;
+	code_review_rate_limit?: {
+		primary_window?: OpenAIUsageWindow | null;
+	} | null;
+	credits?: {
+		has_credits?: boolean;
+		unlimited?: boolean;
+		balance?: string | null;
+	} | null;
+}
+
+type CodexUsageApiResult =
+	| { success: true; usage: CodexUsage }
+	| { success: false; error: string };
+
+function windowUsedPercent(window: OpenAIUsageWindow | null | undefined): number {
+	return clampPercent(Number(window?.used_percent ?? 0));
+}
+
+function windowMinutes(window: OpenAIUsageWindow | null | undefined, fallback: number): number {
+	const seconds = Number(window?.limit_window_seconds);
+	return Number.isFinite(seconds) && seconds > 0 ? seconds / 60 : fallback;
+}
+
+function windowResetAfterSeconds(window: OpenAIUsageWindow | null | undefined): number {
+	const seconds = Number(window?.reset_after_seconds);
+	return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds) : 0;
+}
+
+function windowResetAt(window: OpenAIUsageWindow | null | undefined): number {
+	const resetAt = Number(window?.reset_at);
+	if (Number.isFinite(resetAt) && resetAt > 0) return Math.round(resetAt);
+	const resetAfter = windowResetAfterSeconds(window);
+	return resetAfter > 0 ? Math.round(Date.now() / 1000) + resetAfter : 0;
+}
+
 // ───────── Codex Usage Check ─────────
 
-async function checkCodexUsage(token: string, accountId: string): Promise<CodexUsage> {
+async function checkCodexUsageFromUsageApi(token: string, accountId: string): Promise<CodexUsageApiResult> {
+	try {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+
+		let response: Response;
+		try {
+			response = await fetch(OPENAI_USAGE_URL, {
+				headers: {
+					"Authorization": `Bearer ${token}`,
+					"ChatGPT-Account-Id": accountId,
+					"User-Agent": `pi-usage (${os.platform()} ${os.release()}; ${os.arch()})`,
+				},
+				signal: controller.signal,
+			});
+		} finally {
+			clearTimeout(timeout);
+		}
+
+		if (!response.ok) {
+			let detail = `HTTP ${response.status}`;
+			try {
+				const body = await response.text();
+				detail = body.substring(0, 160) || detail;
+			} catch { /* ignore */ }
+			return { success: false, error: `OpenAI usage API: ${detail}` };
+		}
+
+		const data = (await response.json()) as OpenAIUsageResponse;
+		const primary = data.rate_limit?.primary_window;
+		if (!primary) {
+			return { success: false, error: "OpenAI usage API: no primary quota window" };
+		}
+
+		const secondary = data.rate_limit?.secondary_window;
+		const codeReview = data.code_review_rate_limit?.primary_window;
+		const usage: CodexUsage = {
+			planType: data.plan_type ?? "unknown",
+			activeLimit: data.rate_limit?.limit_reached ? "rate_limited" : "normal",
+			primaryUsedPercent: windowUsedPercent(primary),
+			secondaryUsedPercent: windowUsedPercent(secondary),
+			codeReviewUsedPercent: codeReview ? windowUsedPercent(codeReview) : undefined,
+			primaryWindowMinutes: windowMinutes(primary, 300),
+			secondaryWindowMinutes: windowMinutes(secondary, 10080),
+			codeReviewWindowMinutes: codeReview ? windowMinutes(codeReview, 0) : undefined,
+			primaryResetAfterSeconds: windowResetAfterSeconds(primary),
+			secondaryResetAfterSeconds: windowResetAfterSeconds(secondary),
+			codeReviewResetAfterSeconds: codeReview ? windowResetAfterSeconds(codeReview) : undefined,
+			primaryResetAt: windowResetAt(primary),
+			secondaryResetAt: windowResetAt(secondary),
+			codeReviewResetAt: codeReview ? windowResetAt(codeReview) : undefined,
+			primaryOverSecondaryLimitPercent: 0,
+			creditsHasCredits: Boolean(data.credits?.has_credits),
+			creditsBalance: data.credits?.balance ?? "",
+			creditsUnlimited: Boolean(data.credits?.unlimited),
+			source: "usage_api",
+		};
+		return { success: true, usage };
+	} catch (e: unknown) {
+		return {
+			success: false,
+			error: e instanceof Error ? e.message : String(e),
+		};
+	}
+}
+
+async function checkCodexUsageWithProbe(token: string, accountId: string): Promise<CodexUsage> {
 	const baseUrl = "https://chatgpt.com/backend-api/codex/responses";
 
 	try {
@@ -410,6 +543,7 @@ async function checkCodexUsage(token: string, accountId: string): Promise<CodexU
 				creditsHasCredits: parseHeaderBool(getHeader("x-codex-credits-has-credits")),
 				creditsBalance: getHeader("x-codex-credits-balance") ?? "",
 				creditsUnlimited: parseHeaderBool(getHeader("x-codex-credits-unlimited")),
+				source: "probe",
 			};
 		}
 
@@ -440,6 +574,7 @@ async function checkCodexUsage(token: string, accountId: string): Promise<CodexU
 				creditsHasCredits: parseHeaderBool(getHeader("x-codex-credits-has-credits")),
 				creditsBalance: getHeader("x-codex-credits-balance") ?? "",
 				creditsUnlimited: parseHeaderBool(getHeader("x-codex-credits-unlimited")),
+				source: "probe",
 				error: "Rate limited (429)",
 			};
 		}
@@ -467,6 +602,7 @@ async function checkCodexUsage(token: string, accountId: string): Promise<CodexU
 			creditsHasCredits: false,
 			creditsBalance: "",
 			creditsUnlimited: false,
+			source: "probe",
 			error: errorMsg,
 		};
 	} catch (e: unknown) {
@@ -485,9 +621,23 @@ async function checkCodexUsage(token: string, accountId: string): Promise<CodexU
 			creditsHasCredits: false,
 			creditsBalance: "",
 			creditsUnlimited: false,
+			source: "probe",
 			error: e instanceof Error ? e.message : String(e),
 		};
 	}
+}
+
+async function checkCodexUsage(token: string, accountId: string): Promise<CodexUsage> {
+	const usageApiResult = await checkCodexUsageFromUsageApi(token, accountId);
+	if (usageApiResult.success) {
+		return usageApiResult.usage;
+	}
+
+	const probeResult = await checkCodexUsageWithProbe(token, accountId);
+	if (probeResult.error && probeResult.activeLimit === "error") {
+		probeResult.error = `${usageApiResult.error}; fallback probe: ${probeResult.error}`;
+	}
+	return probeResult;
 }
 
 // ───────── OpenCode Go Usage Check ─────────
@@ -793,10 +943,22 @@ async function checkOpenCodeGoUsage(
 	apiKey: string | undefined,
 	quotaState: OpenCodeGoQuotaConfigState,
 ): Promise<OpenCodeGoUsage> {
-	const [modelCheck, quotaCheck] = await Promise.all([
-		checkOpenCodeGoModels(apiKey),
-		checkOpenCodeGoQuota(quotaState),
-	]);
+	const quotaCheck = await checkOpenCodeGoQuota(quotaState);
+	if (quotaCheck.monthlyUsedPercent !== undefined) {
+		const quotaExhausted = quotaCheck.monthlyUsedPercent >= 100;
+		return {
+			available: !quotaExhausted,
+			status: quotaExhausted ? "rate_limited" : "available",
+			quotaConfigured: quotaCheck.configured,
+			quotaSource: quotaCheck.source,
+			monthlyUsedPercent: quotaCheck.monthlyUsedPercent,
+			monthlyRemainingPercent: quotaCheck.monthlyRemainingPercent,
+			monthlyResetAfterSeconds: quotaCheck.monthlyResetAfterSeconds,
+			monthlyResetAt: quotaCheck.monthlyResetAt,
+		};
+	}
+
+	const modelCheck = await checkOpenCodeGoModels(apiKey);
 
 	return {
 		...modelCheck,
@@ -835,7 +997,9 @@ function buildUsageWidget(
 			lines.push(`${theme.fg("error", "✗ Codex")} ${theme.fg("dim", "— " + codex.error)}`);
 		} else {
 			const planLabel = codex.planType !== "unknown" ? ` (${codex.planType})` : "";
-			const limitLabel = codex.activeLimit !== "unknown" ? ` [${codex.activeLimit}]` : "";
+			const limitLabel = codex.activeLimit !== "unknown" && codex.activeLimit !== "normal"
+				? ` [${codex.activeLimit}]`
+				: "";
 
 			// 5hr window
 			const p5 = codex.primaryUsedPercent;
@@ -866,6 +1030,19 @@ function buildUsageWidget(
 			lines.push(
 				`  week  ${theme.fg(pWColor, pWBar)} ${theme.fg(pWColor, `${pW.toFixed(0)}%`)}${theme.fg("dim", pWReset)}`,
 			);
+			if (codex.codeReviewUsedPercent !== undefined) {
+				const pC = codex.codeReviewUsedPercent;
+				const pCColor = usageColor(pC);
+				const pCBar = progressBar(pC);
+				const pCReset = codex.codeReviewResetAt
+					? ` resets ${formatResetTime(codex.codeReviewResetAt)}`
+					: codex.codeReviewResetAfterSeconds
+						? ` resets in ${formatDuration(codex.codeReviewResetAfterSeconds)}`
+						: "";
+				lines.push(
+					`  review ${theme.fg(pCColor, pCBar)} ${theme.fg(pCColor, `${pC.toFixed(0)}%`)}${theme.fg("dim", pCReset)}`,
+				);
+			}
 
 			// Credits info
 			if (codex.creditsHasCredits && codex.creditsBalance) {

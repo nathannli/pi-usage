@@ -6,13 +6,13 @@ Usage limit checker extension for [pi coding agent](https://github.com/badlogic/
 
 When pi starts up, **pi-usage** automatically:
 
-1. **Codex** — Makes a minimal API request to the Codex backend and reads the `x-codex-*` rate limit headers to show your:
+1. **Codex** — Calls the ChatGPT usage endpoint first, then falls back to a minimal Codex backend request only if that usage endpoint fails. It shows your:
    - **5hr window** usage percentage (primary limit)
    - **Weekly window** usage percentage (secondary limit)
    - Reset times for both windows
    - Plan type, active limit, and credits info
 
-2. **OpenCode Go** — Checks the dashboard quota and probes available Go models to show:
+2. **OpenCode Go** — Checks the dashboard quota first, then probes Go models only if dashboard scraping is not configured or fails. It shows:
    - **Monthly usage percentage** from the OpenCode Go dashboard, when configured
    - Monthly reset time
    - Whether Go models are **available** or **rate limited**
@@ -138,7 +138,9 @@ When limits are running high, the progress bars and percentages turn **yellow** 
 
 ### Codex Rate Limits
 
-The Codex backend returns rate limit information via HTTP response headers on every API request:
+pi-usage first calls `https://chatgpt.com/backend-api/wham/usage` with the same OAuth token that pi stores for Codex/OpenAI auth. This returns the plan type, 5-hour window, weekly window, reset times, and credits without making a model request.
+
+If that endpoint fails, pi-usage falls back to the older Codex backend header probe. The fallback response returns rate limit information via HTTP response headers:
 
 | Header | Description |
 |--------|-------------|
@@ -152,13 +154,13 @@ The Codex backend returns rate limit information via HTTP response headers on ev
 | `x-codex-active-limit` | Active limit tier |
 | `x-codex-credits-*` | Credit balance info |
 
-pi-usage makes a **minimal streaming request** (model: `gpt-5.4-mini`, instruction: "ok", input: "hi") to capture these headers. This costs virtually nothing (~5 tokens) but provides the most accurate usage data.
+The fallback makes a **minimal streaming request** (model: `gpt-5.4-mini`, instruction: "ok", input: "hi") to capture these headers. It should only run when the usage endpoint is unavailable.
 
 ### OpenCode Go
 
-OpenCode Go does not currently expose a public usage/balance API. pi-usage can scrape the authenticated dashboard page at `https://opencode.ai/workspace/<workspaceId>/go` and parse the embedded monthly quota data when `OPENCODE_GO_WORKSPACE_ID` and `OPENCODE_GO_AUTH_COOKIE` are configured.
+OpenCode Go does not currently expose a public usage/balance API. pi-usage scrapes the authenticated dashboard page at `https://opencode.ai/workspace/<workspaceId>/go` and parses the embedded monthly quota data when `OPENCODE_GO_WORKSPACE_ID` and `OPENCODE_GO_AUTH_COOKIE` are configured.
 
-Separately, pi-usage probes models by making minimal requests (`max_tokens: 1`) and checking for:
+If the dashboard scrape is not configured or fails, pi-usage falls back to probing models with minimal requests (`max_tokens: 1`) and checking for:
 - **200 OK** → model is available
 - **429** → rate limited
 - **401/403** → credits error or auth issue
