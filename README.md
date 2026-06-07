@@ -2,6 +2,16 @@
 
 Usage limit checker extension for [pi coding agent](https://github.com/badlogic/pi-mono) — shows **Codex** and **OpenCode Go** usage limits at startup so you know your limits before you start coding.
 
+## Fork Notice
+
+This is a fork of [timm-u/pi-usage](https://github.com/timm-u/pi-usage) with added features and fixes. See the [Fork Feature Changelog](#fork-feature-changelog) below for details.
+
+## Fork Feature Changelog
+
+- **Hide services without keys** — Footer and widget no longer show Codex or Go when their respective API key/token is not available. Previously, Go would show `⚠` or `—` in the footer even when only the regular OpenCode API key was set (same key shared by both services but Go not in use).
+- **Fix `/usage` widget gating** — Widget display now respects key availability, same as the footer.
+- **Recover from key removal** — State is properly reset when a previously present API key is removed, hiding that section immediately.
+
 ## What It Does
 
 When pi starts up, **pi-usage** automatically:

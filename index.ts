@@ -1034,6 +1034,8 @@ function buildUsageWidget(
 	go: OpenCodeGoUsage | undefined,
 	theme: any,
 	loading: boolean,
+	codexTokenFound: boolean,
+	goKeyFound: boolean,
 ): Text {
 	if (loading) {
 		return new Text(theme.fg("muted", "⚡ Checking usage limits..."), 0, 0);
@@ -1046,7 +1048,7 @@ function buildUsageWidget(
 	lines.push(theme.bold(theme.fg("accent", "⚡ Usage Limits")));
 
 	// ── Codex ──
-	if (codex) {
+	if (codexTokenFound && codex) {
 		if (codex.error && codex.activeLimit === "error") {
 			lines.push(theme.fg("dim", sep.repeat(40)));
 			lines.push(`${theme.fg("error", "✗ Codex")} ${theme.fg("dim", "— " + codex.error)}`);
@@ -1107,13 +1109,13 @@ function buildUsageWidget(
 				lines.push(`  ${theme.fg("warning", `⚠ 5hr exceeds weekly allocation: ${codex.primaryOverSecondaryLimitPercent}%`)}`);
 			}
 		}
-	} else {
+	} else if (!codexTokenFound && !goKeyFound) {
 		lines.push(theme.fg("dim", sep.repeat(40)));
-		lines.push(theme.fg("dim", "Codex — not configured"));
+		lines.push(theme.fg("dim", "No providers configured"));
 	}
 
 	// ── OpenCode Go ──
-	if (go) {
+	if (goKeyFound && go && goUsageHasData(go)) {
 		lines.push(theme.fg("dim", sep.repeat(40)));
 		const icon = statusIcon(go.status);
 		const goColorMap: Record<GoModelStatus, string> = {
@@ -1189,9 +1191,6 @@ function buildUsageWidget(
 		if (go.error) {
 			lines.push(`  ${theme.fg("dim", go.error.substring(0, 80))}`);
 		}
-	} else {
-		lines.push(theme.fg("dim", sep.repeat(40)));
-		lines.push(theme.fg("dim", "OpenCode Go — not configured"));
 	}
 
 	return new Text(lines.join("\n"), 0, 0);
@@ -1207,14 +1206,14 @@ function goFooterSummary(go: OpenCodeGoUsage): string {
 	return quotaParts.length > 0 ? quotaParts.join("/") : statusIcon(go.status);
 }
 
-function updateFooterStatus(ctx: any, codex: CodexUsage | undefined, go: OpenCodeGoUsage | undefined): void {
+function updateFooterStatus(ctx: any, codex: CodexUsage | undefined, go: OpenCodeGoUsage | undefined, codexTokenFound: boolean, goKeyFound: boolean): void {
 	if (!ctx.hasUI) return;
 
 	const parts: string[] = [];
-	if (codexUsageHasData(codex)) {
+	if (codexTokenFound && codexUsageHasData(codex)) {
 		parts.push(`Codex:${codex!.primaryUsedPercent.toFixed(0)}%/${codex!.secondaryUsedPercent.toFixed(0)}%`);
 	}
-	if (go) {
+	if (goKeyFound && go && goUsageHasData(go)) {
 		parts.push(`Go:${goFooterSummary(go)}`);
 	}
 	if (parts.length > 0) {
@@ -1228,24 +1227,30 @@ function codexUsageHasData(codex: CodexUsage | undefined): codex is CodexUsage &
 	return codex !== undefined && codex.error === undefined && codex.activeLimit !== "error";
 }
 
+function goUsageHasData(go: OpenCodeGoUsage | undefined): boolean {
+	return go !== undefined && go.status !== "error" && go.status !== "no_key";
+}
+
 // ───────── Extension ─────────
 
 export default function (pi: ExtensionAPI) {
 	let codexUsage: CodexUsage | undefined;
 	let goUsage: OpenCodeGoUsage | undefined;
+	let codexTokenFound = false;
+	let goKeyFound = false;
 	let isLoading = false;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 	let currentCtx: any;
 
-	async function refreshUsage(ctx: any): Promise<void> {
+	async function refreshUsage(ctx: any, showWidget: boolean = false): Promise<void> {
 		if (isLoading) return;
 		isLoading = true;
 		currentCtx = ctx;
 
-		// Show loading state
-		if (ctx.hasUI) {
+		// Show loading state in widget if requested
+		if (showWidget && ctx.hasUI) {
 			ctx.ui.setWidget(WIDGET_ID, (_tui: any, theme: any) =>
-				buildUsageWidget(codexUsage, goUsage, theme, true),
+				buildUsageWidget(codexUsage, goUsage, theme, true, codexTokenFound, goKeyFound),
 			);
 		}
 
@@ -1253,16 +1258,20 @@ export default function (pi: ExtensionAPI) {
 
 		// Check Codex
 		const codexAuth = await getCodexToken();
+		codexTokenFound = codexAuth !== undefined;
 		if (codexAuth) {
 			checks.push(
 				checkCodexUsage(codexAuth.token, codexAuth.accountId).then((result) => {
 					codexUsage = result;
 				}),
 			);
+		} else {
+			codexUsage = undefined;
 		}
 
 		// Check OpenCode Go
 		const goKey = getOpenCodeApiKey();
+		goKeyFound = goKey !== undefined;
 		const goQuotaState = getOpenCodeGoQuotaConfig();
 		if (goKey || goQuotaState.config || goQuotaState.error) {
 			checks.push(
@@ -1279,36 +1288,24 @@ export default function (pi: ExtensionAPI) {
 
 		isLoading = false;
 
-		// Update widget with results
-		if (ctx.hasUI) {
+		// Update widget if requested
+		if (showWidget && ctx.hasUI) {
 			ctx.ui.setWidget(WIDGET_ID, (_tui: any, theme: any) =>
-				buildUsageWidget(codexUsage, goUsage, theme, false),
+				buildUsageWidget(codexUsage, goUsage, theme, false, codexTokenFound, goKeyFound),
 			);
+		}
 
-			// Footer status
-			updateFooterStatus(ctx, codexUsage, goUsage);
-
-			// Quick notification
-			const parts: string[] = [];
-			if (codexUsageHasData(codexUsage)) {
-				parts.push(`Codex 5hr:${codexUsage!.primaryUsedPercent.toFixed(0)}% week:${codexUsage!.secondaryUsedPercent.toFixed(0)}%`);
-			} else if (codexUsage?.error) {
-				parts.push(`Codex: ✗ ${codexUsage.error.substring(0, 30)}`);
-			}
-			if (goUsage) {
-				parts.push(`Go:${goFooterSummary(goUsage)}`);
-			}
-			if (parts.length > 0) {
-				ctx.ui.notify(`⚡ ${parts.join(" │ ")}`, "info");
-			}
+		// Always update footer status
+		if (ctx.hasUI) {
+			updateFooterStatus(ctx, codexUsage, goUsage, codexTokenFound, goKeyFound);
 		}
 	}
 
-	// ── Startup check ──
+	// ── Startup check (footer only, no widget) ──
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason === "startup" || event.reason === "reload") {
 			// Small delay to let TUI settle
-			setTimeout(() => refreshUsage(ctx), 500);
+			setTimeout(() => refreshUsage(ctx, false), 500);
 		}
 	});
 
@@ -1316,7 +1313,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (refreshTimer) clearInterval(refreshTimer);
 		refreshTimer = setInterval(() => {
-			if (currentCtx) refreshUsage(currentCtx).catch(() => {});
+			if (currentCtx) refreshUsage(currentCtx, false).catch(() => {});
 		}, AUTO_REFRESH_MINUTES * 60 * 1000);
 	});
 
@@ -1327,11 +1324,18 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// ── /usage command ──
+	// ── /usage command (show widget) ──
 	pi.registerCommand("usage", {
-		description: "Refresh and show Codex & OpenCode Go usage limits",
+		description: "Refresh and display Codex & OpenCode Go usage limits",
 		handler: async (_args, ctx) => {
-			await refreshUsage(ctx);
+			await refreshUsage(ctx, true);
+
+			// Auto-dismiss widget after 10 seconds
+			setTimeout(() => {
+				if (ctx.hasUI) {
+					ctx.ui.setWidget(WIDGET_ID, undefined);
+				}
+			}, 10_000);
 		},
 	});
 }
